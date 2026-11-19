@@ -1,87 +1,83 @@
-/* nvme-cli-inspired demonstration. No SSD commands are actually sent. */
+/* Full nvme-cli-like usage, without platform APIs or manual parser state. */
 #include "argparse.h"
-#include <inttypes.h>
 #include <stdio.h>
 
-typedef struct format_config {
-    uint32_t nsid;
-    uint8_t lbaf;
-    uint8_t ses;
-    bool dry_run;
-    unsigned int verbose;
-} format_config;
-
-typedef struct identify_config {
-    uint32_t nsid;
-    const char *output;
-} identify_config;
-
-int main(int argc, char **argv)
+static int cmd_security_send(int argc, char *argv[])
 {
-    format_config fmt = { 1, 0, 0, false, 0 };
-    identify_config id = { 1, "normal" };
-    const ap_option format_opts[] = {
-        { "namespace-id", 'n', AP_U32, &fmt.nsid, "nsid",
-          "Namespace ID (decimal or hex)", 0, NULL },
-        { "lbaf", 'l', AP_U8, &fmt.lbaf, "lbaf",
-          "LBA format index", 0, NULL },
-        { "ses", 's', AP_U8, &fmt.ses, "ses",
-          "Secure erase settings", 0, NULL },
-        { "dry-run", 0, AP_FLAG, &fmt.dry_run, NULL,
-          "Print the request without executing it", 0, NULL },
-        { "verbose", 'v', AP_COUNT_FLAG, &fmt.verbose, NULL,
-          "Increase verbosity (repeatable)", 0, NULL }
-    };
-    const ap_option id_opts[] = {
-        { "namespace-id", 'n', AP_U32, &id.nsid, "nsid",
-          "Namespace ID", 0, NULL },
-        { "output-format", 'o', AP_CHOICE, &id.output, "format",
-          "Display format", 0, "normal|json|binary" }
-    };
-    const ap_command commands[] = {
-        { "format", "Prepare Format NVM parameters (demo only)",
-          "<device>", format_opts, AP_COUNT(format_opts),
-          NULL, 0, 1, 1 },
-        { "id-ctrl", "Identify controller (demo only)",
-          "<device>", id_opts, AP_COUNT(id_opts),
-          NULL, 0, 1, 1 }
-    };
-    const ap_command root = {
-        "ssdctl", "Portable C command-line parser example",
-        NULL, NULL, 0, commands, AP_COUNT(commands), 0, 0
-    };
-    const char *positionals[8];
-    unsigned char seen[16];
-    ap_result result = { 0 };
-    ap_status st;
-    result.positionals = positionals;
-    result.positional_capacity = AP_COUNT(positionals);
-    result.seen = seen;
-    result.seen_capacity = AP_COUNT(seen);
+    const char *desc = "Send a TCG Security Protocol payload (demo only).";
+    struct config {
+        unsigned int protocol;
+        uint16_t comid;
+        char *data;
+        bool dry_run;
+        int verbose;
+    } cfg = { 1u, 0x1001u, NULL, false, 0 };
 
-    st = ap_parse(&root, argc, (const char *const *)argv, &result);
-    if (st == AP_HELP) {
-        ap_print_help(stdout, &root, result.command);
-        return 0;
-    }
-    if (st != AP_OK) {
-        fprintf(stderr, "error: %s\n", result.error[0] ? result.error
-                                                         : ap_status_name(st));
-        ap_print_help(stderr, &root, result.command);
-        return 2;
-    }
+    OPT_ARGS(opts) = {
+        OPT_UINT("protocol", 'p', &cfg.protocol, "Security protocol number"),
+        OPT_U16("comid", 'c', &cfg.comid, "TCG ComID"),
+        OPT_STR("data", 'd', &cfg.data, "Payload file name"),
+        OPT_FLAG("dry-run", 0, &cfg.dry_run, "Do not send anything"),
+        OPT_INCR("verbose", 'v', &cfg.verbose, "More verbose output"),
+        OPT_END()
+    };
 
-    if (result.command == &commands[0]) {
-        printf("FORMAT (demo; nothing sent)\n");
-        printf("  device=%s nsid=%" PRIu32 " lbaf=%u ses=%u dry_run=%s verbose=%u\n",
-               result.positionals[0], fmt.nsid, (unsigned)fmt.lbaf,
-               (unsigned)fmt.ses, fmt.dry_run ? "true" : "false", fmt.verbose);
-        printf("  lbaf_explicit=%s\n",
-               ap_was_provided(&result, "lbaf") ? "true" : "false");
-    } else if (result.command == &commands[1]) {
-        printf("IDENTIFY (demo; nothing sent)\n");
-        printf("  device=%s nsid=%" PRIu32 " output=%s\n",
-               result.positionals[0], id.nsid, id.output);
-    }
+    int rc = parse_args(argc, argv, desc, opts);
+    if (rc) return rc;
+    printf("security-send: protocol=%u comid=0x%04x data=%s dry-run=%s verbose=%d\n",
+           cfg.protocol, (unsigned)cfg.comid,
+           cfg.data ? cfg.data : "(none)", cfg.dry_run ? "true" : "false", cfg.verbose);
     return 0;
+}
+
+static int cmd_identify(int argc, char *argv[])
+{
+    const char *desc = "Identify namespace in a portable CLI demonstration.";
+    struct config {
+        unsigned int namespace_id;
+        bool raw_binary;
+        char *device;
+    } cfg = { 0u, false, NULL };
+    static const ap_named_value nvme_nsid_values[] = {
+        AP_VALUE("all", UINT32_MAX, "All namespaces"),
+        AP_VALUE_END()
+    };
+    const char *namespace_id_desired = "Namespace identifier";
+    const char *raw_identify = "Print raw binary data";
+
+    OPT_ARGS(opts) = {
+        /* Exactly the same 4/5 argument macro style as the posted nvme-cli code. */
+        OPT_UINT("namespace-id", 'n', &cfg.namespace_id,
+                 namespace_id_desired, nvme_nsid_values),
+        OPT_FLAG("raw-binary", 'b', &cfg.raw_binary, raw_identify),
+        OPT_POSITIONAL_OPT("device", &cfg.device, "Optional device path"),
+        OPT_END()
+    };
+
+    int rc = parse_args(argc, argv, desc, opts);
+    if (rc) return rc;
+    printf("identify: nsid=%u raw=%s device=%s provided=%s\n",
+           cfg.namespace_id, cfg.raw_binary ? "true" : "false",
+           cfg.device ? cfg.device : "(none)",
+           argconfig_given(opts, &cfg.namespace_id) ? "yes" : "no");
+    return 0;
+}
+
+static const ap_command sim_commands[] = {
+    AP_COMMAND("security-send", cmd_security_send, "Security Protocol Send"),
+    AP_COMMAND("identify", cmd_identify, "Identify namespace")
+};
+static const ap_command ssd_commands[] = {
+    AP_GROUP("sim", "TCG SSD simulator", sim_commands)
+};
+static const ap_command root_commands[] = {
+    AP_GROUP("ssd", "SSD subcommands", ssd_commands)
+};
+
+int main(int argc, char *argv[])
+{
+    int rc = dispatch_commands(argc, argv, "Portable TCG SSD command-line example",
+                               root_commands);
+    /* --help is not an error for the process. */
+    return rc == AP_PARSE_HELP ? 0 : rc == AP_PARSE_OK ? 0 : 1;
 }

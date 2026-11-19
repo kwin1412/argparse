@@ -3,423 +3,368 @@
 #include <limits.h>
 #include <string.h>
 
-static ap_status ap_fail(ap_result *r, ap_status code, int index,
-                         const char *message, const char *detail)
+static int ap_value_type(ap_type type)
 {
-    r->error_index = index;
-    if (detail)
-        (void)snprintf(r->error, sizeof(r->error), "%s: %s", message, detail);
-    else
-        (void)snprintf(r->error, sizeof(r->error), "%s", message);
-    return code;
+    return type != AP_TYPE_FLAG && type != AP_TYPE_INCR;
 }
 
-static int ap_is_value_option(ap_type t)
+static int ap_unsigned_type(ap_type type)
 {
-    return t != AP_FLAG && t != AP_COUNT_FLAG;
+    return type == AP_TYPE_UINT || type == AP_TYPE_U8 || type == AP_TYPE_U16 ||
+           type == AP_TYPE_U32 || type == AP_TYPE_U64;
 }
 
-static const ap_option *ap_find_long(const ap_command *c, const char *s,
-                                     size_t len, size_t *index)
+static int ap_valid_type(ap_type type)
 {
-    size_t k;
-    for (k = 0; k < c->option_count; ++k) {
-        const char *name = c->options[k].long_name;
-        if (name && strlen(name) == len && strncmp(name, s, len) == 0) {
-            *index = k;
-            return &c->options[k];
-        }
-    }
-    return NULL;
+    return type >= AP_TYPE_FLAG && type <= AP_TYPE_CSTR;
 }
 
-static const ap_option *ap_find_short(const ap_command *c, char ch,
-                                      size_t *index)
+/* Locale-independent unsigned parser; no errno, strtoull, or allocations. */
+static int ap_uint64(const char *value, uint64_t limit, uint64_t *result)
 {
-    size_t k;
-    for (k = 0; k < c->option_count; ++k) {
-        if (c->options[k].short_name == ch) {
-            *index = k;
-            return &c->options[k];
-        }
-    }
-    return NULL;
-}
-
-static const ap_command *ap_find_command(const ap_command *c, const char *name)
-{
-    size_t k;
-    for (k = 0; k < c->subcommand_count; ++k) {
-        if (c->subcommands[k].name && strcmp(c->subcommands[k].name, name) == 0)
-            return &c->subcommands[k];
-    }
-    return NULL;
-}
-
-/* Strict ASCII numeric parsing, without locale, errno, strto*, or overflow. */
-static int ap_parse_magnitude(const char *s, uint64_t limit, uint64_t *out)
-{
-    uint64_t n = 0;
+    const unsigned char *p = (const unsigned char *)value;
     unsigned base = 10;
-    int digit_seen = 0;
-    const unsigned char *p = (const unsigned char *)s;
+    uint64_t number = 0;
+    int any = 0;
+
+    if (!value) return 0;
     if (*p == '+') ++p;
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-        base = 16;
         p += 2;
+        base = 16;
     }
     for (; *p; ++p) {
-        unsigned d;
-        if (*p >= '0' && *p <= '9') d = (unsigned)(*p - '0');
-        else if (*p >= 'a' && *p <= 'f') d = (unsigned)(*p - 'a') + 10;
-        else if (*p >= 'A' && *p <= 'F') d = (unsigned)(*p - 'A') + 10;
+        unsigned digit;
+        if (*p >= '0' && *p <= '9') digit = (unsigned)(*p - '0');
+        else if (*p >= 'a' && *p <= 'f') digit = (unsigned)(*p - 'a') + 10u;
+        else if (*p >= 'A' && *p <= 'F') digit = (unsigned)(*p - 'A') + 10u;
         else return 0;
-        if (d >= base || n > (limit - d) / base) return 0;
-        n = n * base + d;
-        digit_seen = 1;
+        if (digit >= base || digit > limit ||
+            number > (limit - digit) / base) return 0;
+        number = number * base + digit;
+        any = 1;
     }
-    if (!digit_seen) return 0;
-    *out = n;
+    if (!any) return 0;
+    *result = number;
     return 1;
 }
 
-static int ap_parse_signed(const char *s, uint64_t positive_max,
-                           uint64_t negative_magnitude_max, int64_t *out)
+static int ap_int64(const char *value, uint64_t pos_limit,
+                    uint64_t neg_limit, int64_t *result)
 {
-    int negative = (*s == '-');
-    uint64_t m;
-    if (negative) ++s;
-    if (!ap_parse_magnitude(s,
-            negative ? negative_magnitude_max : positive_max, &m)) return 0;
-    /* Avoid implementation-defined uint64_t -> int64_t for INT64_MIN. */
-    if (negative && m == ((uint64_t)INT64_MAX + 1u))
-        *out = INT64_MIN;
+    int negative;
+    uint64_t number;
+    if (!value) return 0;
+    negative = value[0] == '-';
+    if (!ap_uint64(negative ? value + 1 : value,
+                   negative ? neg_limit : pos_limit, &number)) return 0;
+    if (negative && number == (uint64_t)INT64_MAX + UINT64_C(1))
+        *result = INT64_MIN;
     else
-        *out = negative ? -(int64_t)m : (int64_t)m;
+        *result = negative ? -(int64_t)number : (int64_t)number;
     return 1;
 }
 
-static int ap_choice_valid(const char *choices, const char *value)
-{
-    const char *p;
-    size_t n;
-    if (!choices) return 0;
-    n = strlen(value);
-    p = choices;
-    for (;;) {
-        const char *end = strchr(p, '|');
-        size_t len = end ? (size_t)(end - p) : strlen(p);
-        if (len == n && strncmp(p, value, n) == 0) return 1;
-        if (!end) return 0;
-        p = end + 1;
-    }
-}
-
-static ap_status ap_assign(const ap_option *o, const char *v,
-                            ap_result *r, int arg_index)
-{
-    uint64_t u = 0;
-    int64_t s = 0;
-    if (!o->value) return ap_fail(r, AP_ERR_SCHEMA, arg_index,
-                                   "option has a NULL destination", o->long_name);
-    switch (o->type) {
-    case AP_FLAG:
-        *(bool *)o->value = true;
-        return AP_OK;
-    case AP_COUNT_FLAG:
-        if (*(unsigned int *)o->value == UINT_MAX)
-            return ap_fail(r, AP_ERR_INVALID_VALUE, arg_index,
-                           "counter overflow", o->long_name);
-        ++*(unsigned int *)o->value;
-        return AP_OK;
-    case AP_STRING:
-        *(const char **)o->value = v;
-        return AP_OK;
-    case AP_CHOICE:
-        if (!ap_choice_valid(o->choices, v))
-            return ap_fail(r, AP_ERR_INVALID_VALUE, arg_index,
-                           "value not in choices", v);
-        *(const char **)o->value = v;
-        return AP_OK;
-    case AP_U8:
-        if (!ap_parse_magnitude(v, UINT8_MAX, &u)) break;
-        *(uint8_t *)o->value = (uint8_t)u;
-        return AP_OK;
-    case AP_U16:
-        if (!ap_parse_magnitude(v, UINT16_MAX, &u)) break;
-        *(uint16_t *)o->value = (uint16_t)u;
-        return AP_OK;
-    case AP_U32:
-        if (!ap_parse_magnitude(v, UINT32_MAX, &u)) break;
-        *(uint32_t *)o->value = (uint32_t)u;
-        return AP_OK;
-    case AP_U64:
-        if (!ap_parse_magnitude(v, UINT64_MAX, &u)) break;
-        *(uint64_t *)o->value = u;
-        return AP_OK;
-    case AP_I32:
-        if (!ap_parse_signed(v, INT32_MAX, (uint64_t)INT32_MAX + 1u, &s)) break;
-        *(int32_t *)o->value = (int32_t)s;
-        return AP_OK;
-    case AP_I64:
-        if (!ap_parse_signed(v, INT64_MAX, (uint64_t)INT64_MAX + 1u, &s)) break;
-        *(int64_t *)o->value = s;
-        return AP_OK;
-    default:
-        return ap_fail(r, AP_ERR_SCHEMA, arg_index, "unknown option type",
-                       o->long_name);
-    }
-    return ap_fail(r, AP_ERR_INVALID_VALUE, arg_index,
-                   "invalid or out-of-range numeric value", v);
-}
-
-static ap_status ap_check_required(const ap_command *c, ap_result *r, int i)
-{
-    size_t k;
-    for (k = 0; k < c->option_count; ++k) {
-        if ((c->options[k].flags & AP_OPT_REQUIRED) && !r->seen[k])
-            return ap_fail(r, AP_ERR_REQUIRED, i, "required option missing",
-                           c->options[k].long_name);
-    }
-    return AP_OK;
-}
-
-static ap_status ap_enter(const ap_command *c, ap_result *r, int i)
-{
-    size_t k, j;
-    if (c->option_count > r->seen_capacity || (c->option_count && !r->seen))
-        return ap_fail(r, AP_ERR_CAPACITY, i, "option scratch buffer too small", c->name);
-    if (c->option_count && !c->options)
-        return ap_fail(r, AP_ERR_SCHEMA, i, "missing options array", c->name);
-    if (c->subcommand_count && !c->subcommands)
-        return ap_fail(r, AP_ERR_SCHEMA, i, "missing subcommands array", c->name);
-    if (c->min_args > c->max_args)
-        return ap_fail(r, AP_ERR_SCHEMA, i, "invalid positional bounds", c->name);
-    for (k = 0; k < c->option_count; ++k) {
-        const ap_option *o = &c->options[k];
-        if (!o->value || (!o->long_name && !o->short_name) ||
-            o->short_name == '-' || o->short_name == 'h' ||
-            (o->long_name && (o->long_name[0] == '\0' ||
-                              strcmp(o->long_name, "help") == 0 ||
-                              strchr(o->long_name, '=') != NULL)) ||
-            (o->type == AP_CHOICE && !o->choices))
-            return ap_fail(r, AP_ERR_SCHEMA, i, "invalid option declaration", c->name);
-        for (j = 0; j < k; ++j) {
-            const ap_option *prev = &c->options[j];
-            if ((o->short_name && prev->short_name == o->short_name) ||
-                (o->long_name && prev->long_name &&
-                 strcmp(o->long_name, prev->long_name) == 0))
-                return ap_fail(r, AP_ERR_SCHEMA, i, "duplicate option name", c->name);
-        }
-    }
-    if (c->option_count) memset(r->seen, 0, c->option_count);
-    r->command = c;
-    return AP_OK;
-}
-
-ap_status ap_parse(const ap_command *root, int argc,
-                   const char *const argv[], ap_result *r)
-{
-    const ap_command *cmd;
-    ap_status status;
-    int i, end_options = 0;
-    if (!r) return AP_ERR_ARGUMENT;
-    r->error_index = -1;
-    r->error[0] = '\0';
-    r->positional_count = 0;
-    r->command = root;
-    if (!root || argc < 0 || (argc > 0 && !argv) ||
-        (r->positional_capacity && !r->positionals))
-        return ap_fail(r, AP_ERR_ARGUMENT, -1, "invalid parser arguments", NULL);
-    cmd = root;
-    status = ap_enter(cmd, r, 0);
-    if (status != AP_OK) return status;
-
-    for (i = 1; i < argc; ++i) {
-        const char *token = argv[i];
-        if (!token)
-            return ap_fail(r, AP_ERR_ARGUMENT, i, "NULL argument", NULL);
-        if (!end_options && strcmp(token, "--") == 0) {
-            end_options = 1;
-            continue;
-        }
-        if (!end_options && token[0] == '-' && token[1] == '-' && token[2]) {
-            const char *key = token + 2;
-            const char *equal = strchr(key, '=');
-            size_t key_len = equal ? (size_t)(equal - key) : strlen(key);
-            const ap_option *opt;
-            size_t k;
-            const char *v = NULL;
-            if (key_len == 4 && strncmp(key, "help", 4) == 0 && !equal)
-                return AP_HELP;
-            opt = ap_find_long(cmd, key, key_len, &k);
-            if (!opt)
-                return ap_fail(r, AP_ERR_UNKNOWN_OPTION, i, "unknown option", token);
-            if (ap_is_value_option(opt->type)) {
-                if (equal) v = equal + 1;
-                else if (i + 1 < argc) v = argv[++i];
-                else return ap_fail(r, AP_ERR_MISSING_VALUE, i, "value missing for", token);
-                if (!v) return ap_fail(r, AP_ERR_ARGUMENT, i, "NULL value", token);
-            } else if (equal) {
-                return ap_fail(r, AP_ERR_INVALID_VALUE, i,
-                               "flag does not take a value", token);
-            }
-            status = ap_assign(opt, v, r, i);
-            if (status != AP_OK) return status;
-            r->seen[k] = 1;
-            continue;
-        }
-        if (!end_options && token[0] == '-' && token[1] != '\0') {
-            const char *p = token + 1;
-            while (*p) {
-                size_t k;
-                const ap_option *opt;
-                const char *v = NULL;
-                if (*p == 'h') return AP_HELP;
-                opt = ap_find_short(cmd, *p, &k);
-                if (!opt)
-                    return ap_fail(r, AP_ERR_UNKNOWN_OPTION, i, "unknown short option", token);
-                ++p;
-                if (ap_is_value_option(opt->type)) {
-                    if (*p) v = (*p == '=') ? p + 1 : p;
-                    else if (i + 1 < argc) v = argv[++i];
-                    else return ap_fail(r, AP_ERR_MISSING_VALUE, i,
-                                        "value missing for", token);
-                    if (!v) return ap_fail(r, AP_ERR_ARGUMENT, i, "NULL value", token);
-                    status = ap_assign(opt, v, r, i);
-                    if (status != AP_OK) return status;
-                    r->seen[k] = 1;
-                    break; /* value-taking option consumes remainder of group */
-                }
-                status = ap_assign(opt, NULL, r, i);
-                if (status != AP_OK) return status;
-                r->seen[k] = 1;
-            }
-            continue;
-        }
-        if (cmd->subcommand_count) {
-            const ap_command *next = !end_options ? ap_find_command(cmd, token) : NULL;
-            if (!next)
-                return ap_fail(r, AP_ERR_UNKNOWN_COMMAND, i,
-                               "unknown or missing subcommand", token);
-            status = ap_check_required(cmd, r, i);
-            if (status != AP_OK) return status;
-            status = ap_enter(next, r, i);
-            if (status != AP_OK) return status;
-            cmd = next;
-            end_options = 0;
-            continue;
-        }
-        if (r->positional_count >= r->positional_capacity)
-            return ap_fail(r, AP_ERR_CAPACITY, i,
-                           "positional scratch buffer too small", token);
-        r->positionals[r->positional_count++] = token;
-    }
-    if (cmd->subcommand_count)
-        return AP_HELP; /* no subcommand: display command overview */
-    status = ap_check_required(cmd, r, argc);
-    if (status != AP_OK) return status;
-    if (r->positional_count < cmd->min_args || r->positional_count > cmd->max_args)
-        return ap_fail(r, AP_ERR_ARG_COUNT, argc,
-                       "invalid number of positional arguments", cmd->name);
-    return AP_OK;
-}
-
-bool ap_was_provided(const ap_result *r, const char *name)
-{
-    size_t k;
-    if (!r || !r->command || !r->seen || !name) return false;
-    for (k = 0; k < r->command->option_count && k < r->seen_capacity; ++k) {
-        const char *n = r->command->options[k].long_name;
-        if (n && strcmp(n, name) == 0) return r->seen[k] != 0;
-    }
-    return false;
-}
-
-static int ap_contains(const ap_command *node, const ap_command *target)
+static int ap_enum_value(const ap_named_value *values,
+                         const char *word, uint64_t *result)
 {
     size_t i;
-    if (node == target) return 1;
-    for (i = 0; i < node->subcommand_count; ++i)
-        if (ap_contains(&node->subcommands[i], target)) return 1;
+    if (!values) return 0;
+    /* Arrays supplied here must have AP_VALUE_END() as final element. */
+    for (i = 0; values[i].name; ++i) {
+        if (strcmp(values[i].name, word) == 0) {
+            *result = values[i].value;
+            return 1;
+        }
+    }
     return 0;
 }
 
-static void ap_print_path(FILE *out, const ap_command *node,
-                          const ap_command *target)
+static int ap_assign(ap_option *opt, const char *arg)
 {
-    size_t i;
-    if (node == target) return;
-    for (i = 0; i < node->subcommand_count; ++i) {
-        const ap_command *child = &node->subcommands[i];
-        if (ap_contains(child, target)) {
-            fprintf(out, " %s", child->name);
-            ap_print_path(out, child, target);
-            return;
+    uint64_t u = 0;
+    int64_t s = 0;
+    switch (opt->type) {
+    case AP_TYPE_FLAG:
+        *(bool *)opt->destination = true;
+        break;
+    case AP_TYPE_INCR:
+        if (*(int *)opt->destination == INT_MAX) return 0;
+        ++*(int *)opt->destination;
+        break;
+    case AP_TYPE_STR:
+        *(char **)opt->destination = (char *)arg;
+        break;
+    case AP_TYPE_CSTR:
+        *(const char **)opt->destination = arg;
+        break;
+    case AP_TYPE_UINT:
+    case AP_TYPE_U8:
+    case AP_TYPE_U16:
+    case AP_TYPE_U32:
+    case AP_TYPE_U64: {
+        uint64_t limit = UINT64_MAX;
+        if (opt->type == AP_TYPE_UINT) limit = UINT_MAX;
+        if (opt->type == AP_TYPE_U8) limit = UINT8_MAX;
+        if (opt->type == AP_TYPE_U16) limit = UINT16_MAX;
+        if (opt->type == AP_TYPE_U32) limit = UINT32_MAX;
+        if (!ap_enum_value(opt->values, arg, &u) &&
+            !ap_uint64(arg, limit, &u)) return 0;
+        if (u > limit) return 0;
+        switch (opt->type) {
+        case AP_TYPE_UINT: *(unsigned int *)opt->destination = (unsigned int)u; break;
+        case AP_TYPE_U8: *(uint8_t *)opt->destination = (uint8_t)u; break;
+        case AP_TYPE_U16: *(uint16_t *)opt->destination = (uint16_t)u; break;
+        case AP_TYPE_U32: *(uint32_t *)opt->destination = (uint32_t)u; break;
+        default: *(uint64_t *)opt->destination = u; break;
         }
+        break;
+    }
+    case AP_TYPE_INT:
+    case AP_TYPE_I32:
+    case AP_TYPE_I64: {
+        const uint64_t positive = opt->type == AP_TYPE_INT ? INT_MAX :
+                                  opt->type == AP_TYPE_I32 ? INT32_MAX : INT64_MAX;
+        const uint64_t negative = positive + UINT64_C(1);
+        if (!ap_int64(arg, positive, negative, &s)) return 0;
+        if (opt->type == AP_TYPE_INT) *(int *)opt->destination = (int)s;
+        else if (opt->type == AP_TYPE_I32) *(int32_t *)opt->destination = (int32_t)s;
+        else *(int64_t *)opt->destination = s;
+        break;
+    }
+    default:
+        return 0;
+    }
+    opt->seen++;
+    return 1;
+}
+
+static ap_option *ap_long(ap_option *options, size_t count,
+                          const char *key, size_t len)
+{
+    size_t k;
+    for (k = 0; k < count; ++k)
+        if (options[k].name && strlen(options[k].name) == len &&
+            strncmp(options[k].name, key, len) == 0) return &options[k];
+    return NULL;
+}
+
+static ap_option *ap_short(ap_option *options, size_t count, char ch)
+{
+    size_t k;
+    for (k = 0; k < count; ++k)
+        if (options[k].short_name && options[k].short_name == ch)
+            return &options[k];
+    return NULL;
+}
+
+static ap_option *ap_next_positional(ap_option *options, size_t count)
+{
+    size_t k;
+    for (k = 0; k < count; ++k)
+        if ((options[k].flags & AP_OPT_POSITIONAL) && !options[k].seen)
+            return &options[k];
+    return NULL;
+}
+
+static int ap_schema_valid(ap_option options[], size_t count)
+{
+    size_t i, j;
+    /* OPT_END is required, checked without scanning beyond the actual array. */
+    if (!count || options[count - 1u].type != AP_TYPE_END ||
+        options[count - 1u].name || options[count - 1u].short_name) return 0;
+    for (i = 0; i + 1u < count; ++i) {
+        ap_option *o = &options[i];
+        const int positional = (o->flags & AP_OPT_POSITIONAL) != 0;
+        if (!ap_valid_type(o->type) || !o->destination ||
+            (o->flags & ~(AP_OPT_REQUIRED | AP_OPT_POSITIONAL))) return 0;
+        if (positional) {
+            if (o->name || o->short_name || !o->metavar ||
+                o->type != AP_TYPE_STR) return 0;
+        } else if ((!o->name && !o->short_name) ||
+                   (o->name && (!o->name[0] || strchr(o->name, '=') ||
+                                strcmp(o->name, "help") == 0)) ||
+                   o->short_name == '-' || o->short_name == 'h') return 0;
+        if (o->values && !ap_unsigned_type(o->type)) return 0;
+        for (j = 0; j < i; ++j) {
+            if ((o->name && options[j].name &&
+                 strcmp(o->name, options[j].name) == 0) ||
+                (o->short_name && options[j].short_name == o->short_name))
+                return 0;
+        }
+        o->seen = 0;
+    }
+    return 1;
+}
+
+void ap_print_args_help(FILE *out, const char *program,
+                        const char *description,
+                        const ap_option options[], size_t count)
+{
+    size_t k;
+    fprintf(out, "Usage: %s [options]", program ? program : "command");
+    for (k = 0; k < count; ++k) {
+        if ((options[k].flags & AP_OPT_POSITIONAL) && options[k].metavar) {
+            fprintf(out, (options[k].flags & AP_OPT_REQUIRED) ? " <%s>" : " [%s]",
+                    options[k].metavar);
+        }
+    }
+    fputc('\n', out);
+    if (description && description[0]) fprintf(out, "\n%s\n", description);
+    fputs("\nOptions:\n  -h, --help                 Show this help\n", out);
+    for (k = 0; k < count; ++k) {
+        const ap_option *o = &options[k];
+        if (o->type == AP_TYPE_END || (o->flags & AP_OPT_POSITIONAL)) continue;
+        fputs("  ", out);
+        if (o->short_name) fprintf(out, "-%c, ", o->short_name);
+        else fputs("    ", out);
+        if (o->name) fprintf(out, "--%s", o->name);
+        if (ap_value_type(o->type)) fputs(" <value>", out);
+        if (o->flags & AP_OPT_REQUIRED) fputs(" [required]", out);
+        if (o->description) fprintf(out, "\n      %s", o->description);
+        fputc('\n', out);
     }
 }
 
-void ap_print_help(FILE *out, const ap_command *root, const ap_command *selected)
+static int ap_error(const char *program, const char *message, const char *detail)
 {
-    size_t i;
-    const ap_command *c = selected ? selected : root;
-    if (!out || !root || !c) return;
-    fprintf(out, "Usage: %s", root->name ? root->name : "program");
-    if (c != root && ap_contains(root, c)) ap_print_path(out, root, c);
-    fprintf(out, " [options]"); /* --help is always available */
-    if (c->subcommand_count) fprintf(out, " <command>");
-    if (c->args_usage) fprintf(out, " %s", c->args_usage);
-    else if (c->max_args) fprintf(out, " [args...]");
-    fprintf(out, "\n");
-    if (c->description) fprintf(out, "\n%s\n", c->description);
-    if (c->subcommand_count) {
-        fprintf(out, "\nCommands:\n");
-        for (i = 0; i < c->subcommand_count; ++i) {
-            const ap_command *child = &c->subcommands[i];
-            fprintf(out, "  %-20s %s\n", child->name,
-                    child->description ? child->description : "");
-        }
-    }
-    fprintf(out, "\nOptions:\n  -h, --help             Show this help\n");
-    for (i = 0; i < c->option_count; ++i) {
-        const ap_option *o = &c->options[i];
-        char spec[100];
-        size_t used = 0;
-        spec[0] = '\0';
-        if (o->short_name)
-            used += (size_t)snprintf(spec + used, sizeof(spec) - used,
-                                     "-%c%s", o->short_name,
-                                     o->long_name ? ", " : "");
-        if (o->long_name && used < sizeof(spec))
-            used += (size_t)snprintf(spec + used, sizeof(spec) - used,
-                                     "--%s", o->long_name);
-        if (ap_is_value_option(o->type) && used < sizeof(spec))
-            (void)snprintf(spec + used, sizeof(spec) - used, " <%s>",
-                           o->metavar ? o->metavar : "value");
-        fprintf(out, "  %-33s %s%s", spec,
-                o->help ? o->help : "",
-                (o->flags & AP_OPT_REQUIRED) ? " (required)" : "");
-        if (o->type == AP_CHOICE && o->choices)
-            fprintf(out, " [%s]", o->choices);
-        fprintf(out, "\n");
-    }
+    fprintf(stderr, "error: %s", message);
+    if (detail) fprintf(stderr, ": %s", detail);
+    fprintf(stderr, "\nTry '%s --help' for usage.\n", program ? program : "command");
+    return AP_PARSE_ERROR;
 }
 
-const char *ap_status_name(ap_status status)
+int ap_parse_args_impl(int argc, char *argv[], const char *description,
+                       ap_option options[], size_t count)
 {
-    switch (status) {
-    case AP_OK: return "ok";
-    case AP_HELP: return "help requested";
-    case AP_ERR_ARGUMENT: return "invalid parser arguments";
-    case AP_ERR_SCHEMA: return "invalid command declaration";
-    case AP_ERR_UNKNOWN_COMMAND: return "unknown command";
-    case AP_ERR_UNKNOWN_OPTION: return "unknown option";
-    case AP_ERR_MISSING_VALUE: return "missing option value";
-    case AP_ERR_INVALID_VALUE: return "invalid option value";
-    case AP_ERR_REQUIRED: return "required option missing";
-    case AP_ERR_ARG_COUNT: return "wrong positional count";
-    case AP_ERR_CAPACITY: return "scratch buffer too small";
-    default: return "unknown error";
+    int i, only_positionals = 0;
+    const char *prog = (argc > 0 && argv && argv[0]) ? argv[0] : "command";
+    size_t k;
+    if (!argv || argc < 1 || !options || !ap_schema_valid(options, count))
+        return ap_error(prog, "invalid arguments or option declaration", NULL);
+    for (i = 1; i < argc; ++i) {
+        char *token = argv[i];
+        if (!token) return ap_error(prog, "NULL argument", NULL);
+        if (!only_positionals && strcmp(token, "--") == 0) {
+            only_positionals = 1;
+            continue;
+        }
+        if (!only_positionals && strcmp(token, "--help") == 0) {
+            ap_print_args_help(stdout, prog, description, options, count);
+            return AP_PARSE_HELP;
+        }
+        if (!only_positionals && token[0] == '-' && token[1] == '-' && token[2]) {
+            const char *key = token + 2;
+            const char *equal = strchr(key, '=');
+            const size_t keylen = equal ? (size_t)(equal - key) : strlen(key);
+            const char *value = NULL;
+            ap_option *o = ap_long(options, count - 1u, key, keylen);
+            if (!o) return ap_error(prog, "unknown option", token);
+            if (ap_value_type(o->type)) {
+                if (equal) value = equal + 1;
+                else if (i + 1 < argc) value = argv[++i];
+                else return ap_error(prog, "missing option value", token);
+                if (!value) return ap_error(prog, "NULL option value", token);
+            } else if (equal) return ap_error(prog, "flag takes no value", token);
+            if (!ap_assign(o, value)) return ap_error(prog, "invalid option value", token);
+            continue;
+        }
+        if (!only_positionals && token[0] == '-' && token[1]) {
+            const char *p = token + 1;
+            while (*p) {
+                ap_option *o;
+                const char *value = NULL;
+                if (*p == 'h') {
+                    ap_print_args_help(stdout, prog, description, options, count);
+                    return AP_PARSE_HELP;
+                }
+                o = ap_short(options, count - 1u, *p);
+                if (!o) return ap_error(prog, "unknown option", token);
+                ++p;
+                if (ap_value_type(o->type)) {
+                    if (*p) value = *p == '=' ? p + 1 : p;
+                    else if (i + 1 < argc) value = argv[++i];
+                    else return ap_error(prog, "missing option value", token);
+                    if (!value) return ap_error(prog, "NULL option value", token);
+                    if (!ap_assign(o, value))
+                        return ap_error(prog, "invalid option value", token);
+                    break;
+                }
+                if (!ap_assign(o, NULL))
+                    return ap_error(prog, "invalid flag", token);
+            }
+            continue;
+        }
+        {
+            ap_option *o = ap_next_positional(options, count - 1u);
+            if (!o) return ap_error(prog, "unexpected positional argument", token);
+            if (!ap_assign(o, token))
+                return ap_error(prog, "invalid positional argument", token);
+        }
     }
+    for (k = 0; k + 1u < count; ++k) {
+        if ((options[k].flags & AP_OPT_REQUIRED) && !options[k].seen)
+            return ap_error(prog, "required argument missing",
+                            options[k].name ? options[k].name : options[k].metavar);
+    }
+    return AP_PARSE_OK;
+}
+
+bool ap_given_impl(const ap_option options[], size_t count,
+                   const void *destination)
+{
+    size_t k;
+    if (!options || !destination) return false;
+    for (k = 0; k < count; ++k)
+        if (options[k].type != AP_TYPE_END &&
+            options[k].destination == destination && options[k].seen)
+            return true;
+    return false;
+}
+
+bool ap_seen_impl(const ap_option options[], size_t count,
+                  const char *long_name)
+{
+    size_t k;
+    if (!options || !long_name) return false;
+    for (k = 0; k < count; ++k)
+        if (options[k].name && strcmp(options[k].name, long_name) == 0)
+            return options[k].seen != 0;
+    return false;
+}
+
+static void ap_print_commands(FILE *out, const char *name, const char *desc,
+                              const ap_command cmds[], size_t count)
+{
+    size_t k;
+    fprintf(out, "Usage: %s <command> [options]\n", name ? name : "program");
+    if (desc && desc[0]) fprintf(out, "\n%s\n", desc);
+    fputs("\nCommands:\n", out);
+    for (k = 0; k < count; ++k)
+        if (cmds[k].name) fprintf(out, "  %-22s %s\n", cmds[k].name,
+                                  cmds[k].description ? cmds[k].description : "");
+    fputs("\nUse <command> --help for command-specific options.\n", out);
+}
+
+int ap_dispatch_impl(int argc, char *argv[], const char *description,
+                     const ap_command cmds[], size_t count)
+{
+    size_t k;
+    const char *program = (argc > 0 && argv && argv[0]) ? argv[0] : "program";
+    if (!cmds || !argv || argc < 1) return AP_PARSE_ERROR;
+    if (argc == 1 || strcmp(argv[1], "-h") == 0 ||
+        strcmp(argv[1], "--help") == 0) {
+        ap_print_commands(stdout, program, description, cmds, count);
+        return argc == 1 ? AP_PARSE_ERROR : AP_PARSE_HELP;
+    }
+    for (k = 0; k < count; ++k) {
+        if (!cmds[k].name || strcmp(cmds[k].name, argv[1]) != 0) continue;
+        if (cmds[k].handler) return cmds[k].handler(argc - 1, argv + 1);
+        if (cmds[k].children && cmds[k].child_count)
+            return ap_dispatch_impl(argc - 1, argv + 1,
+                                    cmds[k].description,
+                                    cmds[k].children, cmds[k].child_count);
+        return ap_error(program, "command has no handler", cmds[k].name);
+    }
+    return ap_error(program, "unknown command", argv[1]);
 }
