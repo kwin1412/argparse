@@ -57,7 +57,7 @@
         {
             "label": "格式化: clang-format",
             "type": "shell",
-            "command": "clang-format -i module/src/*.c module/include/*.h example/*.c",
+            "command": "clang-format -i argparse/src/*.c argparse/include/*.h example/*.c",
             "problemMatcher": []
         }
     ]
